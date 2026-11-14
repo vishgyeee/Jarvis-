@@ -20,21 +20,41 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
 import java.util.Locale
 
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
+
+    private val SYSTEM = "Tum Jarvis ho, Iron Man jaisa smart aur respectful voice assistant. " +
+        "User ko 'Boss' bolo. Hinglish ya Hindi mein chhote, saaf jawab do (2-3 vaakya). " +
+        "Emoji, bullets aur markdown mat use karo."
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var recognizer: SpeechRecognizer? = null
     private lateinit var statusView: TextView
     private lateinit var engine: CommandEngine
+    private lateinit var providerButton: Button
+    private val client = OkHttpClient()
+    private val history = JSONArray()
     private var hindi = true
+    // 0 = Claude, 1 = Gemini, 2 = OpenRouter
+    private var provider = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this, this)
         val prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+        provider = prefs.getInt("provider", 0)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -50,75 +70,70 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
 
         statusView = TextView(this).apply {
-            text = "Boss, mic dabao aur bolo, ya 'Hamesha sunta raho' on karo."
+            text = "Boss, mic dabao aur bolo."
             textSize = 17f
             setTextColor(Color.WHITE)
             setPadding(0, 24, 0, 24)
         }
         val scroll = ScrollView(this).apply { addView(statusView) }
 
+        providerButton = Button(this).apply {
+            text = "Dimaag: " + providerName()
+            setOnClickListener {
+                provider = (provider + 1) % 3
+                prefs.edit().putInt("provider", provider).apply()
+                text = "Dimaag: " + providerName()
+                statusView.text = "Ab " + providerName() + " use hoga, Boss. Neeche iski key daalo."
+            }
+        }
+
         val keyBox = EditText(this).apply {
-            hint = "API key (optional, baad mein)"
+            hint = "Is provider ki API key daalo"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val saveButton = Button(this).apply {
-            text = "API key save karo"
+            text = "Key save karo"
             setOnClickListener {
                 val k = keyBox.text.toString().trim()
                 if (k.isNotEmpty()) {
-                    prefs.edit().putString("key", k).apply()
+                    prefs.edit().putString("key_$provider", k).apply()
                     keyBox.setText("")
-                    statusView.text = "API key save ho gayi, Boss."
+                    statusView.text = providerName() + " ki key save ho gayi, Boss."
                 }
             }
         }
 
         val micButton = Button(this).apply {
-            text = "🎤  Bolo (ek baar)"
-            textSize = 18f
+            text = "🎤  Bolo"
+            textSize = 20f
             setOnClickListener { startListening() }
-        }
-
-        val bgButton = Button(this).apply {
-            text = "🟢 Hamesha sunta raho (ON karo)"
-            setOnClickListener {
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                    != PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-                    return@setOnClickListener
-                }
-                if (Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 3)
-                }
-                val svc = Intent(this@MainActivity, JarvisService::class.java)
-                if (text.contains("ON")) {
-                    startForegroundService(svc)
-                    text = "🔴 Background service (OFF karo)"
-                    statusView.text = "Ab Jarvis hamesha sunega. 'Jarvis' bolkar command do, Boss."
-                } else {
-                    stopService(svc)
-                    text = "🟢 Hamesha sunta raho (ON karo)"
-                    statusView.text = "Background service band kar diya."
-                }
-            }
         }
 
         root.addView(title)
         root.addView(scroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(providerButton)
         root.addView(keyBox)
         root.addView(saveButton)
         root.addView(micButton)
-        root.addView(bgButton)
         setContentView(root)
 
         engine = CommandEngine(this, tts) { reply ->
             statusView.text = statusView.text.toString() + "\n\nJarvis: " + reply
         }
+    }
+
+    private fun providerName(): String = when (provider) {
+        0 -> "Claude"
+        1 -> "Gemini"
+        else -> "OpenRouter"
+    }
+
+    private fun currentKey(): String {
+        val prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+        return prefs.getString("key_$provider", "") ?: ""
     }
 
     private fun startListening() {
@@ -173,9 +188,166 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 statusView.text = "Kuch sunai nahi diya. Dobara bolo."
             } else {
                 statusView.text = "Aap: $text"
-                engine.handle(text)
+                handleOrAsk(text)
             }
         }
+    }
+
+    // Pehle fixed commands try karo, wo na samjhe to AI ko bhejo
+    private fun handleOrAsk(raw: String) {
+        val t = raw.lowercase(Locale.ROOT)
+        val knownWords = listOf(
+            "torch", "volume", "timer", "alarm", "kitne baje", "time", "tarikh",
+            "call", "youtube", "maps", "raasta", "wifi", "bluetooth", "kholo",
+            "chalu karo", "search", "google", "kaun ho", "namaste", "व्हाट्सएप",
+            "टॉर्च", "टाइमर", "कॉल", "यूट्यूब", "खोलो"
+        )
+        if (knownWords.any { t.contains(it) }) {
+            engine.handle(raw)
+        } else {
+            askAI(raw)
+        }
+    }
+
+    private fun askAI(userText: String) {
+        val key = currentKey()
+        if (key.isEmpty()) {
+            val reply = "Boss, ye command mujhe nahi aata. ${providerName()} ki API key daalo to main har sawal ka jawab de paunga."
+            statusView.text = statusView.text.toString() + "\n\nJarvis: " + reply
+            tts?.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+            return
+        }
+        statusView.text = statusView.text.toString() + "\n\nJarvis soch raha hai..."
+
+        history.put(JSONObject().put("role", "user").put("content", userText))
+        while (history.length() > 20) { history.remove(0); history.remove(0) }
+
+        when (provider) {
+            0 -> askClaude(userText, key)
+            1 -> askGemini(userText, key)
+            else -> askOpenRouter(userText, key)
+        }
+    }
+
+    private fun say(reply: String) {
+        history.put(JSONObject().put("role", "assistant").put("content", reply))
+        statusView.text = statusView.text.toString() + "\n\nJarvis: " + reply
+        tts?.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+    }
+
+    private fun showError(msg: String) {
+        if (history.length() > 0) history.remove(history.length() - 1)
+        statusView.text = statusView.text.toString() + "\n\n$msg"
+    }
+
+    // ---------- Claude ----------
+    private fun askClaude(userText: String, key: String) {
+        val body = JSONObject()
+            .put("model", "claude-opus-5-5")
+            .put("max_tokens", 400)
+            .put("system", SYSTEM)
+            .put("messages", JSONArray(history.toString()))
+            .toString()
+            .toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url("https://api.anthropic.com/v1/messages")
+            .addHeader("x-api-key", key)
+            .addHeader("anthropic-version", "2023-06-01")
+            .addHeader("content-type", "application/json")
+            .post(body)
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { showError("Network error: ${e.message}") }
+            }
+            override fun onResponse(call: Call, response: Response) {
+                val raw = response.body?.string() ?: ""
+                runOnUiThread {
+                    if (!response.isSuccessful) { showError("Error ${response.code}: ${raw.take(300)}"); return@runOnUiThread }
+                    try {
+                        val reply = JSONObject(raw).getJSONArray("content").getJSONObject(0).getString("text")
+                        say(reply)
+                    } catch (e: Exception) { showError("Jawab padhne mein dikkat: ${e.message}") }
+                }
+            }
+        })
+    }
+
+    // ---------- Gemini ----------
+    private fun askGemini(userText: String, key: String) {
+        val contents = JSONArray()
+        contents.put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+        contents.put(JSONObject().put("role", "model").put("parts", JSONArray().put(JSONObject().put("text", "Theek hai Boss."))))
+        for (i in 0 until history.length()) {
+            val m = history.getJSONObject(i)
+            val role = if (m.getString("role") == "assistant") "model" else "user"
+            contents.put(JSONObject().put("role", role).put("parts",
+                JSONArray().put(JSONObject().put("text", m.getString("content")))))
+        }
+        val body = JSONObject().put("contents", contents)
+            .toString().toRequestBody("application/json".toMediaType())
+
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$key"
+        val request = Request.Builder().url(url)
+            .addHeader("content-type", "application/json")
+            .post(body).build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { showError("Network error: ${e.message}") }
+            }
+            override fun onResponse(call: Call, response: Response) {
+                val raw = response.body?.string() ?: ""
+                runOnUiThread {
+                    if (!response.isSuccessful) { showError("Error ${response.code}: ${raw.take(300)}"); return@runOnUiThread }
+                    try {
+                        val reply = JSONObject(raw)
+                            .getJSONArray("candidates").getJSONObject(0)
+                            .getJSONObject("content").getJSONArray("parts")
+                            .getJSONObject(0).getString("text")
+                        say(reply)
+                    } catch (e: Exception) { showError("Jawab padhne mein dikkat: ${e.message}") }
+                }
+            }
+        })
+    }
+
+    // ---------- OpenRouter (Qwen / GPT / koi bhi) ----------
+    private fun askOpenRouter(userText: String, key: String) {
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", SYSTEM))
+        for (i in 0 until history.length()) messages.put(history.getJSONObject(i))
+
+        val body = JSONObject()
+            .put("model", "qwen/qwen3.6-plus-preview:free")
+            .put("messages", messages)
+            .toString().toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url("https://openrouter.ai/api/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $key")
+            .addHeader("content-type", "application/json")
+            .post(body).build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { showError("Network error: ${e.message}") }
+            }
+            override fun onResponse(call: Call, response: Response) {
+                val raw = response.body?.string() ?: ""
+                runOnUiThread {
+                    if (!response.isSuccessful) { showError("Error ${response.code}: ${raw.take(300)}"); return@runOnUiThread }
+                    try {
+                        val reply = JSONObject(raw)
+                            .getJSONArray("choices").getJSONObject(0)
+                            .getJSONObject("message").getString("content")
+                        say(reply)
+                    } catch (e: Exception) { showError("Jawab padhne mein dikkat: ${e.message}") }
+                }
+            }
+        })
     }
 
     override fun onInit(status: Int) {
