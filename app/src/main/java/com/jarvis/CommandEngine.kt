@@ -40,6 +40,9 @@ class CommandEngine(
         "नमस्ते" to "namaste", "हेलो" to "namaste",
         "कितने बजे" to "kitne baje", "टाइम" to "time", "समय" to "time",
         "तारीख" to "tarikh", "रास्ता" to "raasta",
+        "पीछे जाओ" to "back", "होम जाओ" to "home", "वापस जाओ" to "back",
+        "स्क्रॉल" to "scroll", "ऊपर" to "upar", "नीचे" to "neeche",
+        "पढ़ो" to "padho", "दबाओ" to "dabao",
         "पांच" to "5", "तीन" to "3", "चार" to "4", "दस" to "10"
     )
 
@@ -100,6 +103,43 @@ class CommandEngine(
                     )
                     say("Bluetooth settings khol di.")
                 }
+
+                // ---------- Naye Accessibility commands ----------
+                has(t, "back") -> {
+                    if (JarvisAccessibilityService.instance?.goBack() != null)
+                        say("Peeche chala gaya, Boss.")
+                    else accessibilityOffMessage()
+                }
+                has(t, "home") -> {
+                    JarvisAccessibilityService.instance?.goHome()
+                    if (JarvisAccessibilityService.instance != null) say("Home par chala gaya.")
+                    else accessibilityOffMessage()
+                }
+                has(t, "recent") -> {
+                    JarvisAccessibilityService.instance?.showRecents()
+                    if (JarvisAccessibilityService.instance != null) say("Recent apps khol diye.")
+                    else accessibilityOffMessage()
+                }
+                has(t, "scroll") -> {
+                    val svc = JarvisAccessibilityService.instance
+                    if (svc == null) { accessibilityOffMessage(); return }
+                    svc.scroll(!has(t, "upar"))
+                    say(if (has(t, "upar")) "Upar scroll kar diya." else "Neeche scroll kar diya.")
+                }
+                has(t, "padho") -> {
+                    val svc = JarvisAccessibilityService.instance
+                    if (svc == null) { accessibilityOffMessage(); return }
+                    say(svc.readScreen())
+                }
+                has(t, "dabao") -> {
+                    val svc = JarvisAccessibilityService.instance
+                    if (svc == null) { accessibilityOffMessage(); return }
+                    val target = query(t, "dabao")
+                    if (target.isEmpty()) { say("Kya dabaun, Boss?"); return }
+                    val ok = svc.tapByText(target)
+                    say(if (ok) "$target dabaya." else "$target nahi mila screen par.")
+                }
+
                 has(t, "kholo", "chalu karo", "start") ->
                     openApp(query(t, "kholo", "chalu", "start"))
                 has(t, "search", "google", "dhundo") -> {
@@ -116,6 +156,10 @@ class CommandEngine(
         } catch (e: Exception) {
             say("Boss, ye kaam nahi ho paya: ${e.message}")
         }
+    }
+
+    private fun accessibilityOffMessage() {
+        say("Boss, pehle Settings mein jaakar Jarvis ki Accessibility permission on karo.")
     }
 
     private fun say(text: String) {
